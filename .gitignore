@@ -1,0 +1,9 @@
+GridfinityForSolidWorks/
+├── .gitignore          ← put it here
+├── GridfinityForSolidWorks.sln
+├── README.md
+├── src/
+├── scripts/
+├── installer/
+├── samples/
+└── ...
