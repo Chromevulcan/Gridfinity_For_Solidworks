@@ -5,7 +5,7 @@
 ;
 ; What the installer does:
 ;   1. Looks for your SolidWorks installation and asks you to confirm (or browse to) the folder.
-;   2. Suggests a "Gridfinity for SolidWorks" folder inside it as the install location, which you confirm.
+;   2. Suggests a separate folder under Program Files as the install location, which you confirm.
 ;   3. Copies the add-in, then copies the three SolidWorks interop DLLs it needs from YOUR SolidWorks install
 ;      (they are not bundled), and registers the add-in with SolidWorks.
 
@@ -52,7 +52,6 @@ Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 [Code]
 var
   SwPage: TInputDirWizardPage;
-  DirSuggested: Boolean;
 
 const
   InteropA = 'SolidWorks.Interop.sldworks.dll';
@@ -118,15 +117,8 @@ begin
     end;
 end;
 
-// Suggest an install folder inside the confirmed SolidWorks folder; the user still confirms it on the next page.
-procedure CurPageChanged(CurPageID: Integer);
-begin
-  if (CurPageID = wpSelectDir) and not DirSuggested then
-  begin
-    DirSuggested := True;
-    WizardForm.DirEdit.Text := RemoveBackslash(SwPage.Values[0]) + '\Gridfinity for SolidWorks';
-  end;
-end;
+// The default install directory is under Program Files, independent of the SolidWorks folder.
+// The SolidWorks folder selected above is used only to locate the interop DLLs.
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
@@ -137,9 +129,9 @@ begin
   begin
     Redist := RemoveBackslash(SwPage.Values[0]) + '\api\redist\';
     AppDir := ExpandConstant('{app}') + '\';
-    FileCopy(Redist + InteropA, AppDir + InteropA, False);
-    FileCopy(Redist + InteropB, AppDir + InteropB, False);
-    FileCopy(Redist + InteropC, AppDir + InteropC, False);
+    CopyFile(Redist + InteropA, AppDir + InteropA, False);
+    CopyFile(Redist + InteropB, AppDir + InteropB, False);
+    CopyFile(Redist + InteropC, AppDir + InteropC, False);
 
     WizardForm.StatusLabel.Caption := 'Registering the add-in with SolidWorks...';
     if (not Exec(ExpandConstant('{dotnet4064}') + '\regasm.exe', '/codebase "' + AppDir + 'Gridfinity.Sw.dll"', '',

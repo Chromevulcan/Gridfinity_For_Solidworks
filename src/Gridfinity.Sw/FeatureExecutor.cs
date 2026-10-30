@@ -299,8 +299,12 @@ namespace Gridfinity.Sw
         {
             try
             {
-                System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "Gridfinity_addin.log"),
-                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + message + System.Environment.NewLine);
+                string dir = System.IO.Path.Combine(
+                    System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData),
+                    "GridfinityForSolidWorks", "Logs");
+                System.IO.Directory.CreateDirectory(dir);
+                System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "Gridfinity_addin.log"),
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + message + System.Environment.NewLine);
             }
             catch { }
         }

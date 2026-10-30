@@ -1,5 +1,8 @@
 using System;
+using System.Collections;
 using System.IO;
+using System.Diagnostics;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using Gridfinity.Core;
@@ -21,51 +24,219 @@ namespace Gridfinity.Sw
     {
         private const string AddInTitle = "Gridfinity Tray Builder";
         private const string AddInDescription = "Parametric Gridfinity trays and part holders.";
-        private const int GroupId = 0x47464E59; // arbitrary, must stay constant between releases
+        private const int GroupId = 0x47464E59;
+        private const int DesignerCommandId = 1;
+        private const int JsonCommandId = 2;
+        private const int MenuDelayMs = 4000;
 
         private ISldWorks _app;
         private int _cookie;
         private ICommandGroup _group;
+        private bool _building;
+        private bool _menuCreated;
+        private long _lastDiagnosticCheckMs;
+        private string _lastObservedGroupState = "not checked";
+        private string _lastCommandManagerIdentity = null;
+        private SldWorks _events;
 
-        // ---- ISwAddin ------------------------------------------------------------------------
-        /// <summary>Where start-up progress is written, so a missing menu can be diagnosed: %TEMP%\Gridfinity_addin.log</summary>
-        private static string LogPath { get { return Path.Combine(Path.GetTempPath(), "Gridfinity_addin.log"); } }
+        private readonly System.Diagnostics.Stopwatch _sinceConnect =
+            new System.Diagnostics.Stopwatch();
+
+        private static readonly object LogLock = new object();
+
+        private static string LogPath
+        {
+            get
+            {
+                return Path.Combine(
+                    System.Environment.GetFolderPath(
+                        System.Environment.SpecialFolder.LocalApplicationData),
+                    "GridfinityForSolidWorks",
+                    "Logs",
+                    "Gridfinity_addin.log");
+            }
+        }
 
         private static void Log(string message)
         {
-            try { File.AppendAllText(LogPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + message + System.Environment.NewLine); }
-            catch { /* logging must never break the add-in */ }
+            try
+            {
+                lock (LogLock)
+                {
+                    string directory = Path.GetDirectoryName(LogPath);
+
+                    if (!Directory.Exists(directory))
+                        Directory.CreateDirectory(directory);
+
+                    File.AppendAllText(
+                        LogPath,
+                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") +
+                        "  " + message + System.Environment.NewLine);
+                }
+            }
+            catch
+            {
+                // Diagnostics must never prevent the add-in from loading.
+            }
         }
 
-        private bool _building;
-        private bool _menuCreated;
-        private SldWorks _events;   // kept so the event hooks stay alive
-        private readonly System.Diagnostics.Stopwatch _sinceConnect = new System.Diagnostics.Stopwatch();
-        private const int MenuDelayMs = 4000;
-
-        private bool StartupFinished()
+        private static void LogEnvironment(ISldWorks app)
         {
-            try { return (bool)((dynamic)_app).StartupProcessCompleted; }
-            catch { return true; } // cannot tell, so do not wait
+            try
+            {
+                Assembly assembly = typeof(GridfinityAddIn).Assembly;
+                string assemblyPath = assembly.Location;
+                Version assemblyVersion = assembly.GetName().Version;
+
+                string fileVersion = string.IsNullOrEmpty(assemblyPath)
+                    ? "unavailable"
+                    : FileVersionInfo.GetVersionInfo(assemblyPath).FileVersion;
+
+                string solidWorksRevision = "unavailable";
+
+                try
+                {
+                    object revision = app.GetType().InvokeMember(
+                        "RevisionNumber",
+                        BindingFlags.InvokeMethod,
+                        null,
+                        app,
+                        null);
+
+                    if (revision != null)
+                        solidWorksRevision = Convert.ToString(revision);
+                }
+                catch (Exception ex)
+                {
+                    solidWorksRevision =
+                        "unavailable (" + ex.GetType().Name + ")";
+                }
+
+                Log("Environment: Add-in assembly version=" +
+                    assemblyVersion +
+                    "; file version=" + fileVersion +
+                    "; assembly path=" + assemblyPath);
+
+                Log("Environment: SOLIDWORKS revision=" +
+                    solidWorksRevision +
+                    "; Windows=" +
+                    System.Environment.OSVersion.VersionString +
+                    "; 64-bit OS=" +
+                    System.Environment.Is64BitOperatingSystem +
+                    "; 64-bit process=" +
+                    System.Environment.Is64BitProcess +
+                    "; .NET CLR=" +
+                    System.Environment.Version);
+
+                Log("Log file: " + LogPath);
+            }
+            catch (Exception ex)
+            {
+                Log("Could not collect environment information: " + ex);
+            }
         }
 
-        // The menu has to be created on SolidWorks' interface thread. ConnectToSW can run elsewhere while SolidWorks is
-        // starting, and a menu made there never shows. SolidWorks events always arrive on the interface thread.
+        // Called by SOLIDWORKS on its UI thread.
         private int OnIdle()
         {
-            // SolidWorks reports start-up as finished before its menus are built, so also wait a few seconds.
-            if (_sinceConnect.ElapsedMilliseconds < MenuDelayMs) return 0;
-            Unhook();
-            CreateMenu("first idle " + (_sinceConnect.ElapsedMilliseconds / 1000.0).ToString("0.0") + " s after connecting");
+            CheckMenuState("idle");
+            LogCommandGroupState("idle");
             return 0;
         }
 
         private int OnActiveDocChanged()
         {
-            if (_sinceConnect.ElapsedMilliseconds < MenuDelayMs) return 0; // too early; the idle event will do it
-            Unhook();
-            CreateMenu("first document");
+            CheckMenuState("active document changed");
             return 0;
+        }
+
+        private int On3DExperienceStateChangeNotify(int newState)
+        {
+            Log("3DEXPERIENCE state changed: newState=" + newState +
+                "; elapsed=" + _sinceConnect.Elapsed.TotalSeconds.ToString("F1") + " seconds after add-in connection.");
+
+            return 0;
+        }
+
+        private void CheckMenuState(string reason)
+        {
+            if (_app == null ||
+                _sinceConnect.ElapsedMilliseconds < MenuDelayMs)
+                return;
+
+            // Create the Gridfinity menu once after SOLIDWORKS has had
+            // time to initialize.
+            //
+            // Do not repeatedly recreate it based on GetCommandGroup()
+            // results. That check has been unreliable and has caused
+            // duplicate menu entries.
+            if (!_menuCreated)
+            {
+                CreateMenu(
+                    reason + " at " +
+                    (_sinceConnect.ElapsedMilliseconds / 1000.0)
+                        .ToString("0.0") +
+                    " s after connecting");
+            }
+        }
+
+        private void LogCommandGroupState(string source)
+        {
+            if (_app == null)
+                return;
+
+            try
+            {
+                var commandManager = _app.GetCommandManager(_cookie);
+
+                if (commandManager == null)
+                {
+                    Log("[" + source + "] Diagnostic: GetCommandManager returned null.");
+                    return;
+                }
+
+                IntPtr identityPointer = Marshal.GetIUnknownForObject(commandManager);
+                string managerIdentity;
+
+                try
+                {
+                    managerIdentity = identityPointer.ToInt64().ToString();
+                }
+                finally
+                {
+                    Marshal.Release(identityPointer);
+                }
+
+                if (_lastCommandManagerIdentity != managerIdentity)
+                {
+                    Log("[" + source + "] Diagnostic: CommandManager COM identity changed from " +
+                        (_lastCommandManagerIdentity ?? "(initial)") + " to " + managerIdentity + ".");
+
+                    // Check the command group using the newly returned CommandManager.
+                    try
+                    {
+                        var group = commandManager.GetCommandGroup(GroupId);
+
+                        Log("[" + source + "] Diagnostic: GetCommandGroup after identity change returned " +
+                            (group == null ? "null" : "a command group") + ".");
+                    }
+                    catch (Exception ex)
+                    {
+                        Log("[" + source + "] Diagnostic: GetCommandGroup after identity change threw: " +
+                            ex.Message);
+                    }
+
+                    // Also check the existing command-group reference.
+                    Log("[" + source + "] Diagnostic: Existing _group reference is " +
+                        (_group == null ? "null" : "not null") + ".");
+
+                    _lastCommandManagerIdentity = managerIdentity;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("[" + source + "] Diagnostic: CommandManager check failed: " + ex.Message);
+            }
         }
 
         private void Hook()
@@ -73,80 +244,349 @@ namespace Gridfinity.Sw
             try
             {
                 _events = (SldWorks)_app;
+
                 _events.OnIdleNotify += OnIdle;
                 _events.ActiveModelDocChangeNotify += OnActiveDocChanged;
+                _events.On3DExperienceStateChangeNotify += On3DExperienceStateChangeNotify;
+
+                Log("Subscribed to OnIdleNotify, ActiveModelDocChangeNotify, and On3DExperienceStateChangeNotify.");
             }
             catch (Exception ex)
             {
-                Log("Could not subscribe to SolidWorks events (" + ex.Message + "); creating the menu now.");
-                _events = null;
-                CreateMenu("no events");
+                Log("Could not subscribe to SOLIDWORKS events: " + ex);
+
+                Unhook();
+
+                // Best-effort fallback.
+                CreateMenu("event subscription fallback");
             }
         }
 
         private void Unhook()
         {
-            if (_events == null) return;
-            try { _events.OnIdleNotify -= OnIdle; } catch { }
-            try { _events.ActiveModelDocChangeNotify -= OnActiveDocChanged; } catch { }
+            if (_events == null)
+                return;
+
+            try
+            {
+                _events.OnIdleNotify -= OnIdle;
+            }
+            catch (Exception ex)
+            {
+                Log("OnIdleNotify unsubscribe failed: " + ex.Message);
+            }
+
+            try
+            {
+                _events.ActiveModelDocChangeNotify -= OnActiveDocChanged;
+            }
+            catch (Exception ex)
+            {
+                Log("ActiveModelDocChangeNotify unsubscribe failed: " +
+                    ex.Message);
+            }
+
+            try
+            {
+                _events.On3DExperienceStateChangeNotify -= On3DExperienceStateChangeNotify;
+            }
+            catch (Exception ex)
+            {
+                Log("On3DExperienceStateChangeNotify unsubscribe failed: " +
+                    ex.Message);
+            }
+
             _events = null;
         }
 
         public bool ConnectToSW(object thisSw, int cookie)
         {
-            // Any failure is logged and the add-in still reports "loaded", so the log can be read afterwards.
             try
             {
-                Log("ConnectToSW start (cookie " + cookie + ", assembly " + typeof(GridfinityAddIn).Assembly.Location + ")");
+                Log("ConnectToSW start (cookie " +
+                    cookie +
+                    ", assembly " +
+                    typeof(GridfinityAddIn).Assembly.Location +
+                    ")");
+
                 _app = (ISldWorks)thisSw;
                 _cookie = cookie;
+
+                LogEnvironment(_app);
+
+                Log("ConnectToSW: SOLIDWORKS add-in connection established.");
+
                 _menuCreated = false;
+                _building = false;
+                _group = null;
+
+                _lastDiagnosticCheckMs = 0;
+                _lastObservedGroupState = "not checked";
+                _lastCommandManagerIdentity = null;
+
                 _app.SetAddinCallbackInfo2(0, this, _cookie);
 
-                // Creating the menu inside ConnectToSW does not work at start-up (the log says it succeeded, but the
-                // Tools menu stays empty), so always wait for SolidWorks' first idle event a few seconds later.
                 _sinceConnect.Restart();
+
                 Hook();
+
                 return true;
             }
             catch (Exception ex)
             {
                 Log("ConnectToSW failed: " + ex);
+
+                // Returning true keeps the add-in loaded so the log
+                // can be inspected.
                 return true;
             }
         }
 
-        private void CreateMenu(string reason)
+        /// <summary>
+        /// Reads the command IDs saved by SOLIDWORKS.
+        /// IgnorePreviousVersion should only be true when the saved
+        /// command definition differs from this version.
+        /// </summary>
+        private bool ShouldIgnorePreviousVersion(
+            ICommandManager commandManager)
         {
-            if (_app == null || _building || _menuCreated) return;
-            _building = true;
-            _menuCreated = true;
             try
             {
-                ICommandManager cm = _app.GetCommandManager(_cookie);
-                try { cm.RemoveCommandGroup2(GroupId, true); } catch { }
+                object savedIds;
 
-                int error = 0;
-                _group = cm.CreateCommandGroup2(GroupId, "Gridfinity", "Gridfinity tray builder",
-                                                "Create parametric Gridfinity trays and part holders", -1, true, ref error);
-                Log("[" + reason + "] CreateCommandGroup2: " + (_group == null ? "NULL" : "ok") + ", error code " + error);
-                if (_group == null) return;
+                bool found =
+                    commandManager.GetGroupDataFromRegistry(
+                        GroupId,
+                        out savedIds);
 
-                int menu = (int)swCommandItemType_e.swMenuItem;
-                int first = _group.AddCommandItem2("Gridfinity designer...", -1, "Design a box, baseplate or part holder", "Designer",
-                                                   0, "OnNewTray", "CanRun", 1, menu);
-                int second = _group.AddCommandItem2("Build from JSON file...", -1, "Build a box or baseplate from a saved definition", "Build from JSON",
-                                                    0, "OnBuildFromJson", "CanRun", 2, menu);
-                Log("[" + reason + "] AddCommandItem2 returned " + first + " and " + second + " (-1 means it failed)");
+                if (!found || savedIds == null)
+                {
+                    Log("No saved command-group IDs found; preserving registry state.");
+                    return false;
+                }
 
-                _group.HasToolbar = false;
-                _group.HasMenu = true;
-                bool activated = _group.Activate();
-                Log("[" + reason + "] Activate returned " + activated);
+                Array ids = savedIds as Array;
+
+                if (ids == null)
+                {
+                    Log("Saved command-group IDs had unexpected type " +
+                        savedIds.GetType().FullName +
+                        "; preserving registry state.");
+
+                    return false;
+                }
+
+                int[] expected =
+                {
+                    DesignerCommandId,
+                    JsonCommandId
+                };
+
+                bool match = ids.Length == expected.Length;
+
+                if (match)
+                {
+                    for (int i = 0; i < expected.Length; i++)
+                    {
+                        try
+                        {
+                            if (Convert.ToInt32(ids.GetValue(i)) != expected[i])
+                            {
+                                match = false;
+                                break;
+                            }
+                        }
+                        catch
+                        {
+                            match = false;
+                            break;
+                        }
+                    }
+                }
+
+                Log("Saved command IDs: [" +
+                    JoinArray(ids) +
+                    "]; current command IDs: [" +
+                    DesignerCommandId +
+                    ", " +
+                    JsonCommandId +
+                    "]; match=" +
+                    match);
+
+                return !match;
             }
             catch (Exception ex)
             {
-                Log("[" + reason + "] CreateMenu failed: " + ex);
+                // Preserve saved user customization if registry lookup fails.
+                Log("GetGroupDataFromRegistry failed; preserving previous settings: " +
+                    ex);
+
+                return false;
+            }
+        }
+
+        private static string JoinArray(Array values)
+        {
+            string[] parts = new string[values.Length];
+
+            for (int i = 0; i < values.Length; i++)
+                parts[i] = Convert.ToString(values.GetValue(i));
+
+            return string.Join(", ", parts);
+        }
+
+        private bool CreateMenu(string reason)
+        {
+            if (_app == null || _building || _menuCreated)
+                return _menuCreated;
+
+            _building = true;
+
+            ICommandManager commandManager = null;
+            ICommandGroup candidateGroup = null;
+
+            try
+            {
+                commandManager = _app.GetCommandManager(_cookie);
+
+                if (commandManager == null)
+                {
+                    Log("[" + reason +
+                        "] GetCommandManager returned NULL; will retry.");
+
+                    return false;
+                }
+
+                bool ignorePreviousVersion =
+                    ShouldIgnorePreviousVersion(commandManager);
+
+                int error = 0;
+
+                candidateGroup = commandManager.CreateCommandGroup2(
+                    GroupId,
+                    "Gridfinity",
+                    "Gridfinity tray builder",
+                    "Create parametric Gridfinity trays and part holders",
+                    -1,
+                    ignorePreviousVersion,
+                    ref error);
+
+                Log("[" + reason +
+                    "] CreateCommandGroup2: " +
+                    (candidateGroup == null ? "NULL" : "ok") +
+                    ", error code " +
+                    error +
+                    ", IgnorePreviousVersion=" +
+                    ignorePreviousVersion);
+
+                if (candidateGroup == null)
+                    return false;
+
+                int menu =
+                    (int)swCommandItemType_e.swMenuItem;
+
+                int designerIndex = candidateGroup.AddCommandItem2(
+                    "Gridfinity designer...",
+                    -1,
+                    "Design a box, baseplate or part holder",
+                    "Designer",
+                    0,
+                    "OnNewTray",
+                    "CanRun",
+                    DesignerCommandId,
+                    menu);
+
+                int jsonIndex = candidateGroup.AddCommandItem2(
+                    "Build from JSON file...",
+                    -1,
+                    "Build a box or baseplate from a saved definition",
+                    "Build from JSON",
+                    0,
+                    "OnBuildFromJson",
+                    "CanRun",
+                    JsonCommandId,
+                    menu);
+
+                Log("[" + reason +
+                    "] AddCommandItem2 returned " +
+                    designerIndex +
+                    " and " +
+                    jsonIndex);
+
+                if (designerIndex < 0 || jsonIndex < 0)
+                {
+                    Log("[" + reason +
+                        "] One or more command items failed; removing partial group.");
+
+                    try
+                    {
+                        commandManager.RemoveCommandGroup2(GroupId, false);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        Log("Partial group cleanup failed: " +
+                            cleanupEx.Message);
+                    }
+
+                    return false;
+                }
+
+                candidateGroup.HasToolbar = false;
+                candidateGroup.HasMenu = true;
+
+                bool activated = candidateGroup.Activate();
+
+                Log("[" + reason +
+                    "] Activate returned " +
+                    activated);
+
+                if (!activated)
+                {
+                    Log("[" + reason +
+                        "] Activation failed; removing partial group.");
+
+                    try
+                    {
+                        commandManager.RemoveCommandGroup2(GroupId, false);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        Log("Activation cleanup failed: " +
+                            cleanupEx.Message);
+                    }
+
+                    return false;
+                }
+
+                _group = candidateGroup;
+                _menuCreated = true;
+                _lastObservedGroupState = "not checked";
+
+                Log("[" + reason +
+                    "] Gridfinity command group created and activated successfully.");
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log("[" + reason +
+                    "] CreateMenu failed; will retry: " +
+                    ex);
+
+                if (candidateGroup != null && commandManager != null)
+                {
+                    try
+                    {
+                        commandManager.RemoveCommandGroup2(GroupId, false);
+                    }
+                    catch (Exception cleanupEx)
+                    {
+                        Log("Exception cleanup failed: " +
+                            cleanupEx.Message);
+                    }
+                }
+
+                return false;
             }
             finally
             {
@@ -156,60 +596,153 @@ namespace Gridfinity.Sw
 
         public bool DisconnectFromSW()
         {
-            Log("DisconnectFromSW");
+            Log("DisconnectFromSW: shutdown requested; connected for " +
+                _sinceConnect.Elapsed.TotalSeconds.ToString("0.0") +
+                " seconds.");
+
+            Log("DisconnectFromSW diagnostic: _menuCreated=" +
+                _menuCreated +
+                "; _group is null=" +
+                (_group == null) +
+                "; cookie=" +
+                _cookie +
+                "; elapsed=" +
+                _sinceConnect.ElapsedMilliseconds +
+                " ms.");
+
             Unhook();
+
             try
             {
-                if (_app != null) _app.GetCommandManager(_cookie).RemoveCommandGroup2(GroupId, true);
+                if (_app != null)
+                {
+                    // Remove the live command group, but preserve saved
+                    // user customization and registry data.
+                    _app.GetCommandManager(_cookie)
+                        .RemoveCommandGroup2(GroupId, false);
+
+                    Log("Removed live command group; preserved saved customization.");
+                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log("Command group removal during disconnect failed: " +
+                    ex.Message);
+            }
+
             _group = null;
             _app = null;
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
+            _menuCreated = false;
+            _building = false;
+
+            _sinceConnect.Stop();
+
             return true;
         }
 
-        // ---- Command callbacks (invoked by name from SolidWorks, so they must be public) ---------
+        // ---- Command callbacks (invoked by name from SOLIDWORKS) ----
+
         public void OnNewTray()
         {
-            using (var form = new TrayDesignerForm(_app))
-                form.ShowDialog(Owner());
+            Log("Command: Gridfinity designer selected.");
+
+            try
+            {
+                using (var form = new TrayDesignerForm(_app))
+                    form.ShowDialog(Owner());
+
+                Log("Command: Gridfinity designer closed.");
+            }
+            catch (Exception ex)
+            {
+                Log("Gridfinity designer command failed: " + ex);
+
+                MessageBox.Show(
+                    Owner(),
+                    ex.Message,
+                    AddInTitle,
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
         }
 
         public void OnBuildFromJson()
         {
-            using (var dlg = new OpenFileDialog { Filter = "Gridfinity JSON (*.json)|*.json|All files (*.*)|*.*" })
+            Log("Command: Build from JSON selected.");
+
+            using (var dlg = new OpenFileDialog
             {
-                if (dlg.ShowDialog(Owner()) != DialogResult.OK) return;
+                Filter = "Gridfinity JSON (*.json)|*.json|All files (*.*)|*.*"
+            })
+            {
+                if (dlg.ShowDialog(Owner()) != DialogResult.OK)
+                {
+                    Log("Build from JSON cancelled by user.");
+                    return;
+                }
+
                 try
                 {
+                    Log("Build from JSON: reading selected definition.");
+
                     string json = File.ReadAllText(dlg.FileName);
+
                     var builder = new GridfinityBuilder(_app);
-                    SwBuildResult r = BaseplateDefinition.LooksLikeBaseplate(json)
-                        ? builder.BuildBaseplate(BaseplateDefinition.FromJson(json))
-                        : ClipDefinition.LooksLikeClips(json)
-                            ? builder.BuildClips(ClipDefinition.FromJson(json))
-                            : builder.Build(TrayDefinition.FromJson(json));
-                    string text = r.Message;
-                    if (r.Warnings.Count > 0) text += "\n\nNotes:\n- " + string.Join("\n- ", r.Warnings.ToArray());
-                    MessageBox.Show(Owner(), text, AddInTitle);
+
+                    SwBuildResult result =
+                        BaseplateDefinition.LooksLikeBaseplate(json)
+                            ? builder.BuildBaseplate(
+                                BaseplateDefinition.FromJson(json))
+                            : ClipDefinition.LooksLikeClips(json)
+                                ? builder.BuildClips(
+                                    ClipDefinition.FromJson(json))
+                                : builder.Build(
+                                    TrayDefinition.FromJson(json));
+
+                    string message = result.Message;
+
+                    if (result.Warnings.Count > 0)
+                    {
+                        message += "\n\nNotes:\n- " +
+                            string.Join(
+                                "\n- ",
+                                result.Warnings.ToArray());
+                    }
+
+                    Log("Build from JSON completed. Warnings=" +
+                        result.Warnings.Count +
+                        "; result message=" +
+                        result.Message);
+
+                    MessageBox.Show(Owner(), message, AddInTitle);
                 }
                 catch (Exception ex)
                 {
-                    MessageBox.Show(Owner(), ex.Message, AddInTitle, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    Log("Build from JSON failed: " + ex);
+
+                    MessageBox.Show(
+                        Owner(),
+                        ex.Message,
+                        AddInTitle,
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
                 }
             }
         }
 
-        public int CanRun() { return 1; } // 1 = enabled
+        public int CanRun()
+        {
+            return 1;
+        }
 
         private IWin32Window Owner()
         {
             try
             {
                 IFrame frame = (IFrame)_app.Frame();
-                return new WindowHandle(new IntPtr(frame.GetHWndx64()));
+
+                return new WindowHandle(
+                    new IntPtr(frame.GetHWndx64()));
             }
             catch
             {
@@ -219,25 +752,34 @@ namespace Gridfinity.Sw
 
         private sealed class WindowHandle : IWin32Window
         {
-            public WindowHandle(IntPtr handle) { Handle = handle; }
+            public WindowHandle(IntPtr handle)
+            {
+                Handle = handle;
+            }
+
             public IntPtr Handle { get; private set; }
         }
 
-        // ---- COM registration (regasm /codebase) -----------------------------------------------
+        // ---- COM registration (regasm /codebase) ----
+
         [ComRegisterFunction]
         public static void RegisterFunction(Type t)
         {
-            string id = "{" + t.GUID.ToString().ToUpperInvariant() + "}";
+            string id =
+                "{" + t.GUID.ToString().ToUpperInvariant() + "}";
 
-            using (RegistryKey key = Registry.LocalMachine.CreateSubKey("SOFTWARE\\SolidWorks\\Addins\\" + id))
+            using (RegistryKey key =
+                Registry.LocalMachine.CreateSubKey(
+                    "SOFTWARE\\SolidWorks\\Addins\\" + id))
             {
-                key.SetValue(null, 0, RegistryValueKind.DWord); // 0 = not loaded at startup by default
+                key.SetValue(null, 0, RegistryValueKind.DWord);
                 key.SetValue("Title", AddInTitle);
                 key.SetValue("Description", AddInDescription);
             }
 
-            // Load at SolidWorks startup for the current user.
-            using (RegistryKey key = Registry.CurrentUser.CreateSubKey("Software\\SolidWorks\\AddInsStartup\\" + id))
+            using (RegistryKey key =
+                Registry.CurrentUser.CreateSubKey(
+                    "Software\\SolidWorks\\AddInsStartup\\" + id))
             {
                 key.SetValue(null, 1, RegistryValueKind.DWord);
             }
@@ -246,9 +788,28 @@ namespace Gridfinity.Sw
         [ComUnregisterFunction]
         public static void UnregisterFunction(Type t)
         {
-            string id = "{" + t.GUID.ToString().ToUpperInvariant() + "}";
-            try { Registry.LocalMachine.DeleteSubKey("SOFTWARE\\SolidWorks\\Addins\\" + id, false); } catch { }
-            try { Registry.CurrentUser.DeleteSubKey("Software\\SolidWorks\\AddInsStartup\\" + id, false); } catch { }
+            string id =
+                "{" + t.GUID.ToString().ToUpperInvariant() + "}";
+
+            try
+            {
+                Registry.LocalMachine.DeleteSubKey(
+                    "SOFTWARE\\SolidWorks\\Addins\\" + id,
+                    false);
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                Registry.CurrentUser.DeleteSubKey(
+                    "Software\\SolidWorks\\AddInsStartup\\" + id,
+                    false);
+            }
+            catch
+            {
+            }
         }
     }
 }

@@ -1,9 +1,6 @@
-GridfinityForSolidWorks/
-├── .gitignore          ← put it here
-├── GridfinityForSolidWorks.sln
-├── README.md
-├── src/
-├── scripts/
-├── installer/
-├── samples/
-└── ...
+bin/
+obj/
+.vs/
+*.user
+installer/Output/
+__pycache__/
